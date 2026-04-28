@@ -1,0 +1,508 @@
+import os
+import re
+import numpy as np
+import mne
+import matplotlib.pyplot as plt
+from scipy.signal import find_peaks
+from scipy import stats
+from autoreject import AutoReject
+import pandas as pd
+
+# ==========================================
+# PATHS & SETTINGS
+# ==========================================
+edf_folder = r"C:\Users\WIN10\Downloads\alpha"
+
+devices    = ['MuseSathena', 'MuseS', 'Muse2']
+conditions = ['EO', 'EC']
+channel_map = {
+    'eeg-ch1': 'TP9',
+    'eeg-ch2': 'AF7',
+    'eeg-ch3': 'AF8',
+    'eeg-ch4': 'TP10'
+}
+channels_to_plot = ['TP9', 'AF7', 'AF8', 'TP10']
+
+# ==========================================
+# HELPERS
+# ==========================================
+def parse_filename(fname):
+    name = fname.replace('.edf', '')
+    for device in devices:
+        if device not in name:
+            continue
+        remainder = name.replace(device, '')
+        m = re.match(r'^(sub\d+)(EO|EC)\d*$', remainder)
+        if m:
+            return m.group(1), m.group(2), device
+    return None
+
+
+def detect_signal_drop(epochs, threshold=1e-6):
+    data = epochs.get_data()
+    return [i for i, ep in enumerate(data)
+            if any(np.all(np.abs(ch) < threshold) for ch in ep)]
+
+
+def run_pipeline(edf_path):
+    try:
+        raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
+        eeg_chs = [c for c in raw.ch_names if 'eeg' in c.lower()][:4]
+        raw.pick(eeg_chs)
+        rename = {k: v for k, v in channel_map.items() if k in raw.ch_names}
+        raw.rename_channels(rename)
+        raw.set_montage('standard_1020', verbose=False)
+        if raw.info['sfreq'] != 256:
+            raw.resample(256, verbose=False)
+        raw.filter(0.5, 20, verbose=False)
+        epochs = mne.make_fixed_length_epochs(raw, duration=4.0,
+                                               preload=True, verbose=False)
+        drop_idx  = detect_signal_drop(epochs)
+        keep_mask = [i not in drop_idx for i in range(len(epochs))]
+        epochs    = epochs[keep_mask]
+        if len(epochs) < 3:
+            print(f"  ✗ Too few epochs ({len(epochs)})")
+            return None
+        ar = AutoReject(n_interpolate=[0], random_state=42, verbose=False)
+        _, log = ar.fit_transform(epochs.copy(), return_log=True)
+        total_epochs = len(epochs)
+        channel_rejection_counts = dict(
+            zip(log.ch_names, np.sum(log.labels, axis=0))
+        )
+        bad_channels = [ch for ch, count in channel_rejection_counts.items()
+                        if count > 0.5 * total_epochs]
+        good_ch_idx    = [i for i, ch in enumerate(log.ch_names)
+                          if ch not in bad_channels]
+        cleaned_labels = log.labels[:, good_ch_idx]
+        rejected_idx   = set(np.where(np.any(cleaned_labels, axis=1))[0])
+        retained_idx   = sorted(set(range(len(epochs))) - rejected_idx)
+        if len(retained_idx) < 3:
+            print(f"  ✗ Too few retained epochs ({len(retained_idx)})")
+            return None
+        cleaned = epochs[retained_idx].copy()
+        if bad_channels:
+            cleaned = cleaned.drop_channels(bad_channels)
+        n_times    = len(cleaned.times)
+        safe_n_fft = min(1024, n_times)
+        safe_n_ov  = safe_n_fft // 2
+        spectrum  = cleaned.compute_psd(method='welch', fmin=0.5, fmax=20,
+                                        n_fft=safe_n_fft, n_overlap=safe_n_ov,
+                                        verbose=False)
+        freqs    = spectrum.freqs
+        psds     = spectrum.get_data()
+        mean_psd = psds.mean(axis=0) if psds.ndim == 3 else psds
+        harmonic_channels = []
+        for ch_idx, ch_name in enumerate(cleaned.info['ch_names']):
+            ch_db    = 10 * np.log10(mean_psd[ch_idx])
+            peaks, _ = find_peaks(ch_db, prominence=5, width=1)
+            if any(10 <= freqs[p] <= 20 for p in peaks):
+                harmonic_channels.append(ch_name)
+        excluded = set(bad_channels) | set(harmonic_channels)
+        to_drop  = [ch for ch in excluded if ch in cleaned.info['ch_names']]
+        if to_drop:
+            cleaned = cleaned.drop_channels(to_drop)
+        if len(cleaned.ch_names) == 0:
+            print(f"  ✗ All channels excluded")
+            return None
+        n_times_f     = len(cleaned.times)
+        safe_n_fft_f  = min(2048, n_times_f)
+        safe_n_ov_f   = safe_n_fft_f // 2
+        spectrum_final = cleaned.compute_psd(method='welch', fmin=0.5,
+                                              fmax=20,
+                                              n_fft=safe_n_fft_f,
+                                              n_overlap=safe_n_ov_f,
+                                              verbose=False)
+        freqs_final    = spectrum_final.freqs
+        psds_final     = spectrum_final.get_data()
+        mean_psd_final = psds_final.mean(axis=0) if psds_final.ndim == 3 else psds_final
+        psd_dict = {}
+        for ch in channels_to_plot:
+            if ch in cleaned.info['ch_names']:
+                idx = cleaned.info['ch_names'].index(ch)
+                psd_dict[ch] = mean_psd_final[idx]
+            else:
+                psd_dict[ch] = np.full(len(freqs_final), np.nan)
+        print(f"  ✓ Good channels : {cleaned.info['ch_names']}")
+        print(f"  ✗ Excluded      : {excluded if excluded else 'none'}")
+        return freqs_final, psd_dict
+    except Exception as e:
+        print(f"  ❌ Error: {e}")
+        return None
+
+
+# ==========================================
+# COLLECT RESULTS
+# ==========================================
+results   = {dev: {cond: {} for cond in conditions} for dev in devices}
+edf_files = sorted([f for f in os.listdir(edf_folder) if f.endswith('.edf')])
+
+print("=" * 60)
+print("RUNNING PIPELINE")
+print("=" * 60)
+for fname in edf_files:
+    parsed = parse_filename(fname)
+    if parsed is None:
+        continue
+    subject, condition, device = parsed
+    print(f"\n→ {fname}  [sub={subject}  cond={condition}  device={device}]")
+    result = run_pipeline(os.path.join(edf_folder, fname))
+    if result is not None:
+        results[device][condition][subject] = result
+
+
+# ==========================================
+# ANALYSIS FUNCTIONS
+# ==========================================
+
+def get_band_power(psd, freqs, fmin, fmax):
+    """Mean power in a frequency band."""
+    mask = (freqs >= fmin) & (freqs <= fmax)
+    return np.mean(psd[mask])
+
+
+def get_iaf(psd, freqs, fmin=7, fmax=13):
+    """
+    Individual Alpha Frequency:
+    Returns (peak_freq, peak_power, cog)
+    cog = centre of gravity (weighted mean frequency)
+    """
+    mask  = (freqs >= fmin) & (freqs <= fmax)
+    f_sub = freqs[mask]
+    p_sub = psd[mask]
+    peaks, props = find_peaks(p_sub, prominence=0.5)
+    if len(peaks) == 0:
+        peak_freq  = np.nan
+        peak_power = np.nan
+    else:
+        best  = peaks[np.argmax(props['prominences'])]
+        peak_freq  = f_sub[best]
+        peak_power = 10 * np.log10(p_sub[best])
+    # Centre of gravity
+    cog = np.sum(f_sub * p_sub) / np.sum(p_sub)
+    return peak_freq, peak_power, cog
+
+
+def cohen_d(a, b):
+    """Cohen's d for two arrays."""
+    pooled_std = np.sqrt((np.std(a, ddof=1)**2 + np.std(b, ddof=1)**2) / 2)
+    if pooled_std == 0:
+        return np.nan
+    return (np.mean(a) - np.mean(b)) / pooled_std
+
+
+# ==========================================
+# COMPUTE ALL METRICS PER DEVICE
+# ==========================================
+all_rows = []
+
+for device in devices:
+    subjects_eo = set(results[device]['EO'].keys())
+    subjects_ec = set(results[device]['EC'].keys())
+    common_subjects = subjects_eo & subjects_ec
+
+    if not common_subjects:
+        print(f"\nNo paired subjects for {device} — skipping metrics")
+        continue
+
+    print(f"\n{'='*60}")
+    print(f"METRICS: {device}  (n={len(common_subjects)} paired subjects)")
+    print(f"{'='*60}")
+
+    for subject in sorted(common_subjects):
+        freqs_eo, psd_eo = results[device]['EO'][subject]
+        freqs_ec, psd_ec = results[device]['EC'][subject]
+
+        for ch in channels_to_plot:
+            p_eo = psd_eo[ch]
+            p_ec = psd_ec[ch]
+
+            if np.all(np.isnan(p_eo)) or np.all(np.isnan(p_ec)):
+                continue
+
+            # 1. Absolute alpha power (dB)
+            abs_eo = 10 * np.log10(get_band_power(p_eo, freqs_eo, 8, 12))
+            abs_ec = 10 * np.log10(get_band_power(p_ec, freqs_ec, 8, 12))
+
+            # 2. Alpha power ratio EC/EO
+            ratio = get_band_power(p_ec, freqs_ec, 8, 12) / \
+                    get_band_power(p_eo, freqs_eo, 8, 12)
+
+            # 3. Alpha reactivity / suppression (dB difference)
+            reactivity = abs_ec - abs_eo  # positive = EC > EO (expected)
+
+            # 4. Relative alpha power (alpha / total)
+            total_eo = get_band_power(p_eo, freqs_eo, 0.5, 20)
+            total_ec = get_band_power(p_ec, freqs_ec, 0.5, 20)
+            rel_eo   = get_band_power(p_eo, freqs_eo, 8, 12) / total_eo
+            rel_ec   = get_band_power(p_ec, freqs_ec, 8, 12) / total_ec
+
+            # 5. IAF from EC (strongest alpha)
+            iaf_freq, iaf_power, iaf_cog = get_iaf(p_ec, freqs_ec)
+
+            row = {
+                'device':       device,
+                'subject':      subject,
+                'channel':      ch,
+                'abs_alpha_EO': abs_eo,
+                'abs_alpha_EC': abs_ec,
+                'ratio_EC_EO':  ratio,
+                'reactivity_dB': reactivity,
+                'rel_alpha_EO': rel_eo,
+                'rel_alpha_EC': rel_ec,
+                'IAF_Hz':       iaf_freq,
+                'IAF_power_dB': iaf_power,
+                'IAF_cog_Hz':   iaf_cog,
+            }
+            all_rows.append(row)
+
+df = pd.DataFrame(all_rows)
+
+if df.empty:
+    print("\n⚠ No paired data available yet — need more subjects processed successfully.")
+else:
+    print("\n" + "=" * 60)
+    print("SUMMARY TABLE")
+    print("=" * 60)
+    print(df.to_string(index=False))
+
+    # Save to TSV
+    tsv_path = os.path.join(edf_folder, 'alpha_metrics_all.tsv')
+    df.to_csv(tsv_path, sep='\t', index=False)
+    print(f"\n✓ Metrics saved → {tsv_path}")
+
+    # ==========================================
+    # PLOT 1: Mean PSD — EO vs EC per device
+    # ==========================================
+    for device in devices:
+        has_data = any(len(results[device][cond]) > 0 for cond in conditions)
+        if not has_data:
+            continue
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        axes = axes.flatten()
+        for ch_idx, ch in enumerate(channels_to_plot):
+            ax = axes[ch_idx]
+            plotted = False
+            for cond, color, ls, label in [
+                ('EO', 'blue', '-',  'Eyes Open'),
+                ('EC', 'red',  '--', 'Eyes Closed'),
+            ]:
+                psd_list = []
+                for subject, (freqs, psd_dict) in results[device][cond].items():
+                    arr = psd_dict.get(ch)
+                    if arr is not None and not np.all(np.isnan(arr)):
+                        psd_list.append(10 * np.log10(arr))
+                if len(psd_list) == 0:
+                    continue
+                psd_array  = np.array(psd_list)
+                mean_curve = psd_array.mean(axis=0)
+                sem_curve  = psd_array.std(axis=0) / np.sqrt(len(psd_array))
+                ax.plot(freqs, mean_curve, color=color, linestyle=ls,
+                        linewidth=2, label=f'{label} (n={len(psd_list)})')
+                ax.fill_between(freqs, mean_curve - sem_curve,
+                                mean_curve + sem_curve, color=color, alpha=0.15)
+                plotted = True
+            if not plotted:
+                ax.text(0.5, 0.5, 'No valid data', ha='center', va='center',
+                        transform=ax.transAxes, fontsize=11, color='grey')
+            ax.axvspan(8, 12, alpha=0.15, color='yellow', label='Alpha band')
+            ax.set_xlim(0.5, 20)
+            ax.set_xlabel('Frequency (Hz)')
+            ax.set_ylabel('Power (dB)')
+            ax.set_title(f'Channel: {ch}')
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+        plt.suptitle(f'{device} — Mean PSD ± SEM\nBlue=EO | Red=EC', fontsize=13)
+        plt.tight_layout()
+        plt.savefig(os.path.join(edf_folder, f'PSD_{device}.png'), dpi=200)
+        plt.show()
+
+    # ==========================================
+    # PLOT 2: Alpha reactivity per channel
+    # ==========================================
+    if not df.empty:
+        fig, axes = plt.subplots(1, len(devices), figsize=(5 * len(devices), 5),
+                                  sharey=True)
+        if len(devices) == 1:
+            axes = [axes]
+
+        for ax, device in zip(axes, devices):
+            sub_df = df[df['device'] == device]
+            if sub_df.empty:
+                ax.set_title(f'{device}\nNo data')
+                continue
+            for ch in channels_to_plot:
+                ch_df = sub_df[sub_df['channel'] == ch]
+                if ch_df.empty:
+                    continue
+                vals = ch_df['reactivity_dB'].values
+                x    = channels_to_plot.index(ch)
+                ax.bar(x, np.mean(vals), color='steelblue', alpha=0.7,
+                       label=ch, width=0.5)
+                ax.errorbar(x, np.mean(vals),
+                            yerr=np.std(vals) / np.sqrt(len(vals)),
+                            fmt='none', color='black', capsize=4)
+                # Individual points
+                for v in vals:
+                    ax.plot(x, v, 'o', color='navy', alpha=0.6)
+
+            ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
+            ax.set_xticks(range(len(channels_to_plot)))
+            ax.set_xticklabels(channels_to_plot)
+            ax.set_title(f'{device}')
+            ax.set_xlabel('Channel')
+            ax.grid(True, alpha=0.3)
+
+        axes[0].set_ylabel('Alpha Reactivity EC−EO (dB)\n(positive = EC > EO ✓)')
+        plt.suptitle('Alpha Reactivity per Channel per Device', fontsize=13)
+        plt.tight_layout()
+        plt.savefig(os.path.join(edf_folder, 'Alpha_Reactivity.png'), dpi=200)
+        plt.show()
+
+    # ==========================================
+    # PLOT 3: Relative alpha — EO vs EC
+    # ==========================================
+    if not df.empty:
+        fig, axes = plt.subplots(1, len(devices), figsize=(5 * len(devices), 5),
+                                  sharey=True)
+        if len(devices) == 1:
+            axes = [axes]
+
+        for ax, device in zip(axes, devices):
+            sub_df = df[df['device'] == device]
+            if sub_df.empty:
+                ax.set_title(f'{device}\nNo data')
+                continue
+            means_eo = sub_df.groupby('channel')['rel_alpha_EO'].mean()
+            means_ec = sub_df.groupby('channel')['rel_alpha_EC'].mean()
+            x = np.arange(len(channels_to_plot))
+            ax.bar(x - 0.2, [means_eo.get(ch, 0) for ch in channels_to_plot],
+                   width=0.35, color='blue', alpha=0.6, label='Eyes Open')
+            ax.bar(x + 0.2, [means_ec.get(ch, 0) for ch in channels_to_plot],
+                   width=0.35, color='red', alpha=0.6, label='Eyes Closed')
+            ax.set_xticks(x)
+            ax.set_xticklabels(channels_to_plot)
+            ax.set_title(f'{device}')
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+
+        axes[0].set_ylabel('Relative Alpha Power\n(alpha / total power)')
+        plt.suptitle('Relative Alpha Power: Eyes Open vs Eyes Closed', fontsize=13)
+        plt.tight_layout()
+        plt.savefig(os.path.join(edf_folder, 'Relative_Alpha.png'), dpi=200)
+        plt.show()
+
+    # ==========================================
+    # PLOT 4: IAF per subject per device
+    # ==========================================
+    if not df.empty:
+        fig, axes = plt.subplots(1, len(devices), figsize=(5 * len(devices), 5),
+                                  sharey=True)
+        if len(devices) == 1:
+            axes = [axes]
+
+        for ax, device in zip(axes, devices):
+            sub_df = df[df['device'] == device].dropna(subset=['IAF_Hz'])
+            if sub_df.empty:
+                ax.set_title(f'{device}\nNo data')
+                continue
+            for ch in channels_to_plot:
+                ch_df = sub_df[sub_df['channel'] == ch]
+                if ch_df.empty:
+                    continue
+                x = channels_to_plot.index(ch)
+                for _, row in ch_df.iterrows():
+                    ax.plot(x, row['IAF_Hz'], 'o', color='purple',
+                            markersize=8, alpha=0.7)
+                    ax.plot(x, row['IAF_cog_Hz'], 's', color='darkorange',
+                            markersize=6, alpha=0.7)
+            ax.axhspan(8, 12, alpha=0.1, color='yellow')
+            ax.set_xticks(range(len(channels_to_plot)))
+            ax.set_xticklabels(channels_to_plot)
+            ax.set_ylim(5, 15)
+            ax.set_title(f'{device}')
+            ax.grid(True, alpha=0.3)
+
+        axes[0].set_ylabel('Frequency (Hz)')
+        # Legend
+        from matplotlib.lines import Line2D
+        legend_elements = [
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='purple',
+                   markersize=8, label='IAF peak'),
+            Line2D([0], [0], marker='s', color='w', markerfacecolor='darkorange',
+                   markersize=6, label='Centre of gravity'),
+        ]
+        axes[-1].legend(handles=legend_elements, fontsize=8)
+        plt.suptitle('Individual Alpha Frequency (IAF) — from Eyes Closed PSD',
+                     fontsize=13)
+        plt.tight_layout()
+        plt.savefig(os.path.join(edf_folder, 'IAF.png'), dpi=200)
+        plt.show()
+
+    # ==========================================
+    # PLOT 5: Band power histograms (Sapien Labs style)
+    # ==========================================
+    bands = {'Delta': (0.5,4), 'Theta': (4,8),
+             'Alpha': (8,12),  'Beta':  (12,20)}
+
+    for device in devices:
+        has_data = any(len(results[device][cond]) > 0 for cond in conditions)
+        if not has_data:
+            continue
+        fig, axes = plt.subplots(len(bands), 2, figsize=(12, len(bands) * 3))
+        for row, (band_name, (fmin, fmax)) in enumerate(bands.items()):
+            for col, (cond, cond_label) in enumerate([('EO', 'Eyes Open'),
+                                                       ('EC', 'Eyes Closed')]):
+                ax = axes[row, col]
+                all_log_powers = []
+                for subject, (freqs, psd_dict) in results[device][cond].items():
+                    band_mask = (freqs >= fmin) & (freqs <= fmax)
+                    for ch, arr in psd_dict.items():
+                        if not np.all(np.isnan(arr)):
+                            all_log_powers.append(
+                                10 * np.log10(np.mean(arr[band_mask]))
+                            )
+                if all_log_powers:
+                    ax.hist(all_log_powers, bins=10, color='#5B4FA8',
+                            edgecolor='white', linewidth=0.5)
+                else:
+                    ax.text(0.5, 0.5, 'No data', ha='center', va='center',
+                            transform=ax.transAxes, color='grey')
+                if row == 0:
+                    ax.set_title(cond_label, fontsize=12, fontweight='bold')
+                if col == 0:
+                    ax.set_ylabel(f'{band_name}\nCount', fontsize=10,
+                                  fontweight='bold', color='#5B4FA8')
+                ax.set_xlabel('Log Power (dB)')
+                ax.grid(True, alpha=0.3)
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+        plt.suptitle(f'{device} — Log-Power Distribution per Band', fontsize=13)
+        plt.tight_layout()
+        plt.savefig(os.path.join(edf_folder, f'BandHist_{device}.png'), dpi=200)
+        plt.show()
+
+    # ==========================================
+    # PRINT COHEN'S D PER DEVICE PER CHANNEL
+    # ==========================================
+    print("\n" + "=" * 60)
+    print("EFFECT SIZES (Cohen's d)  EC vs EO absolute alpha power")
+    print("Note: with N=2 treat as descriptive only")
+    print("=" * 60)
+    for device in devices:
+        sub_df = df[df['device'] == device]
+        if sub_df.empty:
+            continue
+        print(f"\n{device}:")
+        for ch in channels_to_plot:
+            ch_df = sub_df[sub_df['channel'] == ch]
+            if ch_df.empty:
+                continue
+            ec_vals = ch_df['abs_alpha_EC'].values
+            eo_vals = ch_df['abs_alpha_EO'].values
+            d = cohen_d(ec_vals, eo_vals)
+            react = ch_df['reactivity_dB'].mean()
+            iaf   = ch_df['IAF_Hz'].mean()
+            print(f"  {ch:6s} | reactivity={react:+.2f} dB | "
+                  f"Cohen's d={d:.2f} | IAF={iaf:.1f} Hz")
+
+print("\n✅ Done.")
