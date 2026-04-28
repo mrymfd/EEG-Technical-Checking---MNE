@@ -1,0 +1,103 @@
+import mne
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ==========================================
+# STEP 1: Load
+# ==========================================
+raw_eo = mne.io.read_raw_edf(r"C:\Users\WIN10\Downloads\alpha\sub2EOMuse2.edf", preload=True)
+raw_ec = mne.io.read_raw_edf(r"C:\Users\WIN10\Downloads\alpha\sub2ECMuse2.edf", preload=True)
+
+# ==========================================
+# STEP 2: Resample if rates differ
+# ==========================================
+if raw_eo.info['sfreq'] != raw_ec.info['sfreq']:
+    raw_eo.resample(256)
+    raw_ec.resample(256)
+
+# ==========================================
+# STEP 3: Filter
+# ==========================================
+raw_eo.filter(1, 40)
+raw_ec.filter(1, 40)
+
+# ==========================================
+# STEP 4: Pick EEG channels only
+# ==========================================
+eeg_channels = [ch for ch in raw_eo.ch_names if 'eeg' in ch.lower()]
+print("EEG channels:", eeg_channels)
+
+raw_eo.pick_channels(eeg_channels)
+raw_ec.pick_channels(eeg_channels)
+
+# ==========================================
+# STEP 5: Compute PSD
+# ==========================================
+psd_eo = raw_eo.compute_psd(method='welch', fmin=1, fmax=40,  n_fft=1024, n_overlap=512)
+psd_ec = raw_ec.compute_psd(method='welch', fmin=1, fmax=40,  n_fft=1024, n_overlap=512)
+
+# Always use this method — most reliable across MNE versions
+freqs = psd_eo.freqs
+power_eo = psd_eo.get_data()   # shape: (n_channels, n_freqs)
+power_ec = psd_ec.get_data()
+
+# Convert to dB
+power_eo_db = 10 * np.log10(power_eo)
+power_ec_db = 10 * np.log10(power_ec)
+
+# ==========================================
+# STEP 6: Plot — one subplot per channel
+# ==========================================
+n_channels = len(eeg_channels)
+n_cols = 2
+n_rows = int(np.ceil(n_channels / n_cols))
+
+fig, axes = plt.subplots(n_rows, n_cols, figsize=(14, 5 * n_rows))
+axes = axes.flatten()
+
+for i, ch in enumerate(eeg_channels):
+    ax = axes[i]
+
+    ax.plot(freqs, power_eo_db[i],
+            color='blue', linestyle='-', linewidth=1.5, label='Eyes Open')
+    ax.plot(freqs, power_ec_db[i],
+            color='red', linestyle='--', linewidth=1.5, label='Eyes Closed')
+
+    ax.axvspan(8, 12, alpha=0.15, color='yellow', label='Alpha band')
+
+    # Each channel gets its own y scale
+    y_min = min(power_eo_db[i].min(), power_ec_db[i].min())
+    y_max = max(power_eo_db[i].max(), power_ec_db[i].max())
+    margin = (y_max - y_min) * 0.1
+    ax.set_ylim(y_min - margin, y_max + margin)
+
+    ax.set_xlim(1, 40)
+    ax.set_xlabel('Frequency (Hz)')
+    ax.set_ylabel('Power (dB)')
+    ax.set_title(f'Channel: {ch}')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+# Hide unused subplots if n_channels is odd
+for j in range(i + 1, len(axes)):
+    axes[j].set_visible(False)
+
+plt.suptitle('PSD per Channel: Eyes Open vs Eyes Closed', fontsize=14)
+plt.tight_layout()
+plt.show()
+
+# ==========================================
+# STEP 7: Alpha power table
+# ==========================================
+alpha_mask = (freqs >= 8) & (freqs <= 12)
+
+alpha_eo = np.mean(power_eo[:, alpha_mask], axis=1)
+alpha_ec = np.mean(power_ec[:, alpha_mask], axis=1)
+
+print("\nAlpha Power Comparison:")
+print(f"{'Channel':<12} {'Eyes Open':>14} {'Eyes Closed':>14} {'Ratio EC/EO':>12}")
+print("-" * 55)
+for i, ch in enumerate(eeg_channels):
+    ratio = alpha_ec[i] / alpha_eo[i]
+    print(f"{ch:<12} {alpha_eo[i]:>14.6f} {alpha_ec[i]:>14.6f} {ratio:>12.2f}x")
+    
