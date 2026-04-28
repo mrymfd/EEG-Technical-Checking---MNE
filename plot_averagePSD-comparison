@@ -1,0 +1,290 @@
+import os
+import re
+import numpy as np
+import mne
+import matplotlib.pyplot as plt
+from scipy.signal import find_peaks
+from autoreject import AutoReject
+
+# ==========================================
+# PATHS & SETTINGS
+# ==========================================
+edf_folder = r"C:\Users\WIN10\Downloads\alpha"
+
+devices    = ['MuseSathena', 'MuseS', 'Muse2']  # longest first — critical
+conditions = ['EO', 'EC']
+channel_map = {
+    'eeg-ch1': 'TP9',
+    'eeg-ch2': 'AF7',
+    'eeg-ch3': 'AF8',
+    'eeg-ch4': 'TP10'
+}
+channels_to_plot = ['TP9', 'AF7', 'AF8', 'TP10']
+
+# ==========================================
+# HELPERS
+# ==========================================
+def parse_filename(fname):
+    """
+    Handles:
+      sub1EOMuseSathena.edf
+      sub2EO2MuseSathena.edf  (extra digit before device)
+    """
+    name = fname.replace('.edf', '')
+    for device in devices:
+        if device not in name:
+            continue
+        remainder = name.replace(device, '')
+        m = re.match(r'^(sub\d+)(EO|EC)\d*$', remainder)
+        if m:
+            return m.group(1), m.group(2), device
+    return None
+
+
+def detect_signal_drop(epochs, threshold=1e-6):
+    data = epochs.get_data()
+    return [i for i, ep in enumerate(data)
+            if any(np.all(np.abs(ch) < threshold) for ch in ep)]
+
+
+def run_pipeline(edf_path):
+    try:
+        raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
+
+        # Pick only first 4 EEG channels (drops ch5/ch6 if present)
+        eeg_chs = [c for c in raw.ch_names if 'eeg' in c.lower()][:4]
+        raw.pick(eeg_chs)
+
+        rename = {k: v for k, v in channel_map.items() if k in raw.ch_names}
+        raw.rename_channels(rename)
+        raw.set_montage('standard_1020', verbose=False)
+
+        if raw.info['sfreq'] != 256:
+            raw.resample(256, verbose=False)
+
+        raw.filter(0.5, 20, verbose=False)
+
+        epochs = mne.make_fixed_length_epochs(raw, duration=4.0,
+                                               preload=True, verbose=False)
+
+        # Signal drop removal
+        drop_idx  = detect_signal_drop(epochs)
+        keep_mask = [i not in drop_idx for i in range(len(epochs))]
+        epochs    = epochs[keep_mask]
+
+        if len(epochs) < 3:
+            print(f"  ✗ Too few epochs after signal drop removal ({len(epochs)})")
+            return None
+
+        # AutoReject
+        ar = AutoReject(n_interpolate=[0], random_state=42, verbose=False)
+        _, log = ar.fit_transform(epochs.copy(), return_log=True)
+
+        total_epochs = len(epochs)
+        channel_rejection_counts = dict(
+            zip(log.ch_names, np.sum(log.labels, axis=0))
+        )
+        bad_channels = [
+            ch for ch, count in channel_rejection_counts.items()
+            if count > 0.5 * total_epochs
+        ]
+
+        good_ch_idx  = [i for i, ch in enumerate(log.ch_names)
+                        if ch not in bad_channels]
+        cleaned_labels = log.labels[:, good_ch_idx]
+        rejected_idx   = set(np.where(np.any(cleaned_labels, axis=1))[0])
+        retained_idx   = sorted(set(range(len(epochs))) - rejected_idx)
+
+        if len(retained_idx) < 3:
+            print(f"  ✗ Too few retained epochs ({len(retained_idx)})")
+            return None
+
+        cleaned = epochs[retained_idx].copy()
+        if bad_channels:
+            cleaned = cleaned.drop_channels(bad_channels)
+
+        # Harmonic/interference detection (intermediate PSD)
+        n_times    = len(cleaned.times)
+        safe_n_fft = min(1024, n_times)
+        safe_n_ov  = safe_n_fft // 2
+
+        spectrum  = cleaned.compute_psd(method='welch', fmin=0.5, fmax=20,
+                                        n_fft=safe_n_fft, n_overlap=safe_n_ov,
+                                        verbose=False)
+        freqs     = spectrum.freqs
+        psds      = spectrum.get_data()
+        mean_psd  = psds.mean(axis=0) if psds.ndim == 3 else psds
+
+        harmonic_channels = []
+        for ch_idx, ch_name in enumerate(cleaned.info['ch_names']):
+            ch_db    = 10 * np.log10(mean_psd[ch_idx])
+            peaks, _ = find_peaks(ch_db, prominence=5, width=1)
+            if any(10 <= freqs[p] <= 20 for p in peaks):
+                harmonic_channels.append(ch_name)
+
+        excluded = set(bad_channels) | set(harmonic_channels)
+        to_drop  = [ch for ch in excluded if ch in cleaned.info['ch_names']]
+        if to_drop:
+            cleaned = cleaned.drop_channels(to_drop)
+
+        if len(cleaned.ch_names) == 0:
+            print(f"  ✗ All channels excluded")
+            return None
+
+        # Final PSD
+        n_times_f     = len(cleaned.times)
+        safe_n_fft_f  = min(2048, n_times_f)
+        safe_n_ov_f   = safe_n_fft_f // 2
+
+        spectrum_final = cleaned.compute_psd(method='welch', fmin=0.5,
+                                              fmax=20,
+                                              n_fft=safe_n_fft_f,
+                                              n_overlap=safe_n_ov_f,
+                                              verbose=False)
+        freqs_final    = spectrum_final.freqs
+        psds_final     = spectrum_final.get_data()
+        mean_psd_final = psds_final.mean(axis=0) if psds_final.ndim == 3 else psds_final
+
+        # Build output — NaN for excluded channels
+        psd_dict = {}
+        for ch in channels_to_plot:
+            if ch in cleaned.info['ch_names']:
+                idx = cleaned.info['ch_names'].index(ch)
+                psd_dict[ch] = mean_psd_final[idx]
+            else:
+                psd_dict[ch] = np.full(len(freqs_final), np.nan)
+
+        print(f"  ✓ Good channels : {cleaned.info['ch_names']}")
+        print(f"  ✗ Excluded      : {excluded if excluded else 'none'}")
+        return freqs_final, psd_dict
+
+    except Exception as e:
+        print(f"  ❌ Error: {e}")
+        return None
+
+
+# ==========================================
+# PARSING CHECK
+# ==========================================
+edf_files = sorted([f for f in os.listdir(edf_folder) if f.endswith('.edf')])
+
+print("=" * 60)
+print(f"FOUND {len(edf_files)} EDF FILES")
+print("=" * 60)
+for fname in edf_files:
+    parsed = parse_filename(fname)
+    print(f"  {fname:35s} → {parsed}")
+
+# ==========================================
+# COLLECT RESULTS
+# ==========================================
+# results[device][condition][subject] = (freqs, psd_dict)
+results = {dev: {cond: {} for cond in conditions} for dev in devices}
+
+print("\n" + "=" * 60)
+print("RUNNING PIPELINE")
+print("=" * 60)
+
+for fname in edf_files:
+    parsed = parse_filename(fname)
+    if parsed is None:
+        print(f"\n  Skipping (unrecognized): {fname}")
+        continue
+
+    subject, condition, device = parsed
+    print(f"\n→ {fname}  [sub={subject}  cond={condition}  device={device}]")
+
+    result = run_pipeline(os.path.join(edf_folder, fname))
+    if result is not None:
+        results[device][condition][subject] = result
+
+# ==========================================
+# RESULTS SUMMARY
+# ==========================================
+print("\n" + "=" * 60)
+print("RESULTS SUMMARY")
+print("=" * 60)
+total_success = 0
+for device in devices:
+    for cond in conditions:
+        for subject, val in results[device][cond].items():
+            total_success += 1
+            freqs, psd_dict = val
+            good_chs = [ch for ch, arr in psd_dict.items()
+                        if not np.all(np.isnan(arr))]
+            print(f"  ✓ {device:12s} | {cond} | {subject:8s} | {good_chs}")
+print(f"\nTotal successful: {total_success}")
+
+# ==========================================
+# PLOT — one figure per device
+# ==========================================
+print("\n" + "=" * 60)
+print("PLOTTING")
+print("=" * 60)
+
+for device in devices:
+
+    has_data = any(len(results[device][cond]) > 0 for cond in conditions)
+    if not has_data:
+        print(f"  No data for {device} — skipping")
+        continue
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    axes = axes.flatten()
+
+    for ch_idx, ch in enumerate(channels_to_plot):
+        ax = axes[ch_idx]
+        plotted_anything = False
+
+        for cond, color, ls, label in [
+            ('EO', 'blue', '-',  'Eyes Open'),
+            ('EC', 'red',  '--', 'Eyes Closed'),
+        ]:
+            psd_list = []
+            for subject, (freqs, psd_dict) in results[device][cond].items():
+                ch_psd = psd_dict.get(ch)
+                if ch_psd is not None and not np.all(np.isnan(ch_psd)):
+                    psd_list.append(10 * np.log10(ch_psd))
+
+            if len(psd_list) == 0:
+                continue
+
+            psd_array  = np.array(psd_list)
+            mean_curve = psd_array.mean(axis=0)
+            sem_curve  = psd_array.std(axis=0) / np.sqrt(len(psd_array))
+
+            ax.plot(freqs, mean_curve,
+                    color=color, linestyle=ls, linewidth=2,
+                    label=f'{label} (n={len(psd_list)})')
+            ax.fill_between(freqs,
+                            mean_curve - sem_curve,
+                            mean_curve + sem_curve,
+                            color=color, alpha=0.15)
+            plotted_anything = True
+
+        if not plotted_anything:
+            ax.text(0.5, 0.5, 'No valid data',
+                    ha='center', va='center',
+                    transform=ax.transAxes, fontsize=11, color='grey')
+
+        ax.axvspan(8, 12, alpha=0.15, color='yellow', label='Alpha band')
+        ax.set_xlim(0.5, 20)
+        ax.set_xlabel('Frequency (Hz)')
+        ax.set_ylabel('Power (dB)')
+        ax.set_title(f'Channel: {ch}')
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    plt.suptitle(
+        f'Device: {device} — Mean PSD (± SEM across subjects)\n'
+        f'Blue solid = Eyes Open | Red dashed = Eyes Closed',
+        fontsize=13
+    )
+    plt.tight_layout()
+
+    save_path = os.path.join(edf_folder, f'PSD_{device}_EO_vs_EC.png')
+    plt.savefig(save_path, dpi=200)
+    plt.show()
+    print(f"  Saved → {save_path}")
+
+print("\n✅ Done.")
