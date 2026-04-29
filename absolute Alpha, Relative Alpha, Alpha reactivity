@@ -1,0 +1,423 @@
+import os
+import re
+import numpy as np
+import mne
+import matplotlib.pyplot as plt
+from autoreject import AutoReject
+from scipy.signal import find_peaks
+import pandas as pd
+
+# ==========================================
+# PATHS & SETTINGS
+# ==========================================
+edf_folder = r"C:\Users\WIN10\Downloads\alpha"
+
+devices    = ['MuseSathena', 'MuseS', 'Muse2']
+conditions = ['EO', 'EC']
+channel_map = {
+    'eeg-ch1': 'TP9',
+    'eeg-ch2': 'AF7',
+    'eeg-ch3': 'AF8',
+    'eeg-ch4': 'TP10'
+}
+channels_to_plot = ['TP9', 'AF7', 'AF8', 'TP10']
+
+# ==========================================
+# HELPERS
+# ==========================================
+def parse_filename(fname):
+    name = fname.replace('.edf', '')
+    for device in devices:
+        if device not in name:
+            continue
+        remainder = name.replace(device, '')
+        m = re.match(r'^(sub\d+)(EO|EC)(\d*)$', remainder)
+        if m:
+            subject = m.group(1)
+            cond    = m.group(2)
+            trial   = m.group(3) if m.group(3) else '1'
+            return subject, cond, device, trial
+    return None
+
+
+def detect_signal_drop(epochs, threshold=1e-6):
+    data = epochs.get_data()
+    return [i for i, ep in enumerate(data)
+            if any(np.all(np.abs(ch) < threshold) for ch in ep)]
+
+
+def run_pipeline(edf_path):
+    """
+    Returns (freqs, psd_dict, excluded_channels)
+    psd_dict: all 4 channels, NaN array if excluded
+    excluded_channels: set of channel names dropped
+    """
+    try:
+        raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
+        eeg_chs = [c for c in raw.ch_names if 'eeg' in c.lower()][:4]
+        raw.pick(eeg_chs)
+        rename = {k: v for k, v in channel_map.items() if k in raw.ch_names}
+        raw.rename_channels(rename)
+        raw.set_montage('standard_1020', verbose=False)
+        if raw.info['sfreq'] != 256:
+            raw.resample(256, verbose=False)
+        raw.filter(0.5, 20, verbose=False)
+        epochs = mne.make_fixed_length_epochs(raw, duration=4.0,
+                                               preload=True, verbose=False)
+        drop_idx  = detect_signal_drop(epochs)
+        keep_mask = [i not in drop_idx for i in range(len(epochs))]
+        epochs    = epochs[keep_mask]
+        if len(epochs) < 3:
+            print(f"  ✗ Too few epochs ({len(epochs)})")
+            return None
+        ar = AutoReject(n_interpolate=[0], random_state=42, verbose=False)
+        _, log = ar.fit_transform(epochs.copy(), return_log=True)
+        total_epochs = len(epochs)
+        channel_rejection_counts = dict(
+            zip(log.ch_names, np.sum(log.labels, axis=0))
+        )
+        bad_channels = [ch for ch, count in channel_rejection_counts.items()
+                        if count > 0.5 * total_epochs]
+        good_ch_idx    = [i for i, ch in enumerate(log.ch_names)
+                          if ch not in bad_channels]
+        cleaned_labels = log.labels[:, good_ch_idx]
+        rejected_idx   = set(np.where(np.any(cleaned_labels, axis=1))[0])
+        retained_idx   = sorted(set(range(len(epochs))) - rejected_idx)
+        if len(retained_idx) < 3:
+            print(f"  ✗ Too few retained epochs ({len(retained_idx)})")
+            return None
+        cleaned = epochs[retained_idx].copy()
+        if bad_channels:
+            cleaned = cleaned.drop_channels(bad_channels)
+        n_times    = len(cleaned.times)
+        safe_n_fft = min(1024, n_times)
+        safe_n_ov  = safe_n_fft // 2
+        spectrum  = cleaned.compute_psd(method='welch', fmin=0.5, fmax=20,
+                                        n_fft=safe_n_fft, n_overlap=safe_n_ov,
+                                        verbose=False)
+        freqs    = spectrum.freqs
+        psds     = spectrum.get_data()
+        mean_psd = psds.mean(axis=0) if psds.ndim == 3 else psds
+        harmonic_channels = []
+        for ch_idx, ch_name in enumerate(cleaned.info['ch_names']):
+            ch_db    = 10 * np.log10(mean_psd[ch_idx])
+            peaks, _ = find_peaks(ch_db, prominence=5, width=1)
+            if any(10 <= freqs[p] <= 20 for p in peaks):
+                harmonic_channels.append(ch_name)
+        excluded = set(bad_channels) | set(harmonic_channels)
+        to_drop  = [ch for ch in excluded if ch in cleaned.info['ch_names']]
+        if to_drop:
+            cleaned = cleaned.drop_channels(to_drop)
+        if len(cleaned.ch_names) == 0:
+            print(f"  ✗ All channels excluded")
+            return None
+        n_times_f     = len(cleaned.times)
+        safe_n_fft_f  = min(2048, n_times_f)
+        safe_n_ov_f   = safe_n_fft_f // 2
+        spectrum_final = cleaned.compute_psd(method='welch', fmin=0.5,
+                                              fmax=20,
+                                              n_fft=safe_n_fft_f,
+                                              n_overlap=safe_n_ov_f,
+                                              verbose=False)
+        freqs_final    = spectrum_final.freqs
+        psds_final     = spectrum_final.get_data()
+        mean_psd_final = psds_final.mean(axis=0) if psds_final.ndim == 3 \
+                         else psds_final
+        psd_dict = {}
+        for ch in channels_to_plot:
+            if ch in cleaned.info['ch_names']:
+                idx = cleaned.info['ch_names'].index(ch)
+                psd_dict[ch] = mean_psd_final[idx]
+            else:
+                psd_dict[ch] = np.full(len(freqs_final), np.nan)
+        print(f"  ✓ Good     : {cleaned.info['ch_names']}")
+        print(f"  ✗ Excluded : {excluded if excluded else 'none'}")
+        return freqs_final, psd_dict, excluded
+    except Exception as e:
+        print(f"  ❌ Error: {e}")
+        return None
+
+
+# ==========================================
+# METRIC FUNCTIONS
+# ==========================================
+def get_band_power_db(psd, freqs, fmin, fmax):
+    """Mean power in band converted to dB."""
+    mask = (freqs >= fmin) & (freqs <= fmax)
+    return 10 * np.log10(np.mean(psd[mask]))
+
+
+def get_relative_alpha(psd, freqs):
+    """
+    Relative alpha = sum(alpha bins) / sum(all bins) x 100
+    Uses sum so wider bands (more bins) contribute proportionally.
+    Alpha: 8-12 Hz / Total: 0.5-20 Hz
+    """
+    total_mask = (freqs >= 0.5) & (freqs <= 20)
+    alpha_mask = (freqs >= 8)   & (freqs <= 12)
+    return (np.sum(psd[alpha_mask]) / np.sum(psd[total_mask])) * 100
+
+
+# ==========================================
+# RUN PIPELINE ONCE PER FILE
+# results[device][condition][subject][trial] = (freqs, psd_dict, excluded)
+# ==========================================
+results   = {dev: {cond: {} for cond in conditions} for dev in devices}
+edf_files = sorted([f for f in os.listdir(edf_folder) if f.endswith('.edf')])
+
+print("=" * 60)
+print("RUNNING PIPELINE")
+print("=" * 60)
+
+for fname in edf_files:
+    parsed = parse_filename(fname)
+    if parsed is None:
+        continue
+    subject, condition, device, trial = parsed
+    print(f"\n→ {fname}  "
+          f"[sub={subject}  cond={condition}  "
+          f"device={device}  trial={trial}]")
+    result = run_pipeline(os.path.join(edf_folder, fname))
+    if result is not None:
+        if subject not in results[device][condition]:
+            results[device][condition][subject] = {}
+        results[device][condition][subject][trial] = result
+
+
+# ==========================================
+# BUILD UNIFIED METRICS TABLE
+# Same psd_dict used for all three metrics
+# Trials averaged in raw power space before metric computation
+# ==========================================
+rows = []
+
+for device in devices:
+    subjects_eo  = set(results[device]['EO'].keys())
+    subjects_ec  = set(results[device]['EC'].keys())
+    all_subjects = subjects_eo | subjects_ec
+
+    for subject in sorted(all_subjects):
+        for ch in channels_to_plot:
+
+            # Collect valid PSDs per trial — EO
+            eo_psds   = []
+            eo_trials = []
+            eo_freqs  = None
+            if subject in results[device]['EO']:
+                for trial, (freqs, psd_dict, excl) in \
+                        results[device]['EO'][subject].items():
+                    arr = psd_dict[ch]
+                    if not np.all(np.isnan(arr)):
+                        eo_psds.append(arr)
+                        eo_trials.append(trial)
+                        eo_freqs = freqs
+
+            # Collect valid PSDs per trial — EC
+            ec_psds   = []
+            ec_trials = []
+            ec_freqs  = None
+            if subject in results[device]['EC']:
+                for trial, (freqs, psd_dict, excl) in \
+                        results[device]['EC'][subject].items():
+                    arr = psd_dict[ch]
+                    if not np.all(np.isnan(arr)):
+                        ec_psds.append(arr)
+                        ec_trials.append(trial)
+                        ec_freqs = freqs
+
+            # Average PSD across trials in raw power space (not dB)
+            eo_mean_psd = np.mean(eo_psds, axis=0) if eo_psds else None
+            ec_mean_psd = np.mean(ec_psds, axis=0) if ec_psds else None
+
+            # 1. Absolute alpha power (dB)
+            abs_eo = get_band_power_db(eo_mean_psd, eo_freqs, 8, 12) \
+                     if eo_mean_psd is not None else np.nan
+            abs_ec = get_band_power_db(ec_mean_psd, ec_freqs, 8, 12) \
+                     if ec_mean_psd is not None else np.nan
+
+            # 2. Relative alpha power (%) — sum-based, correct
+            rel_eo = get_relative_alpha(eo_mean_psd, eo_freqs) \
+                     if eo_mean_psd is not None else np.nan
+            rel_ec = get_relative_alpha(ec_mean_psd, ec_freqs) \
+                     if ec_mean_psd is not None else np.nan
+
+            # 3. Reactivity = EC - EO in dB
+            reactivity = abs_ec - abs_eo \
+                         if not np.isnan(abs_ec) and not np.isnan(abs_eo) \
+                         else np.nan
+
+            rows.append({
+                'device':          device,
+                'subject':         subject,
+                'channel':         ch,
+                'EO_trials_used':  ','.join(eo_trials) if eo_trials else 'none',
+                'EC_trials_used':  ','.join(ec_trials) if ec_trials else 'none',
+                'n_EO_trials':     len(eo_psds),
+                'n_EC_trials':     len(ec_psds),
+                'abs_EO_dB':       abs_eo,
+                'abs_EC_dB':       abs_ec,
+                'rel_EO_pct':      rel_eo,
+                'rel_EC_pct':      rel_ec,
+                'reactivity_dB':   reactivity,
+            })
+
+df = pd.DataFrame(rows)
+
+# Save
+tsv_path = os.path.join(edf_folder, 'alpha_all_metrics.tsv')
+df.to_csv(tsv_path, sep='\t', index=False)
+print(f"\n✓ Saved → {tsv_path}")
+print("\n" + "=" * 60)
+print("METRICS TABLE")
+print("=" * 60)
+print(df.to_string(index=False))
+
+# Sanity check
+print("\n" + "=" * 60)
+print("SANITY CHECK — relative alpha (expected 15-25%)")
+print("=" * 60)
+print(df[['device','subject','channel',
+          'rel_EO_pct','rel_EC_pct']].to_string(index=False))
+
+
+# ==========================================
+# PLOTTING HELPER
+# ==========================================
+def make_bar(ax, eo_val, ec_val, n_eo=None, n_ec=None, zero_line=False):
+    vals   = [eo_val if not np.isnan(eo_val) else 0,
+              ec_val if not np.isnan(ec_val) else 0]
+    colors = ['#3498db', '#e74c3c']
+    bars   = ax.bar(['Eyes\nOpen', 'Eyes\nClosed'],
+                    vals, color=colors, alpha=0.75, width=0.5)
+
+    for bar, val in zip(bars, [eo_val, ec_val]):
+        if not np.isnan(val):
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + abs(bar.get_height()) * 0.01,
+                    f'{val:.2f}',
+                    ha='center', va='bottom', fontsize=8)
+
+    if np.isnan(eo_val):
+        ax.text(0.25, 0.5, 'excl.', ha='center', va='center',
+                transform=ax.transAxes, color='grey', fontsize=8)
+    if np.isnan(ec_val):
+        ax.text(0.75, 0.5, 'excl.', ha='center', va='center',
+                transform=ax.transAxes, color='grey', fontsize=8)
+
+    if zero_line:
+        ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
+
+    if n_eo is not None and n_ec is not None:
+        ax.text(0.5, -0.18, f'n={n_eo} / n={n_ec}',
+                ha='center', va='top',
+                transform=ax.transAxes, fontsize=7, color='grey')
+
+    # Zoom y-axis to data range so small differences are visible
+    valid = [v for v in [eo_val, ec_val] if not np.isnan(v)]
+    if valid:
+        spread  = max(abs(max(valid) - min(valid)), 0.5)
+        padding = spread * 3
+        ax.set_ylim(min(valid) - padding, max(valid) + padding)
+
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+
+# ==========================================
+# PLOT — one figure per device per subject
+# Row 1: Absolute alpha power (dB)
+# Row 2: Relative alpha power (%)
+# Row 3: Reactivity (EC - EO dB)
+# Cols: one per channel
+# ==========================================
+for device in devices:
+    dev_df = df[df['device'] == device]
+    if dev_df.empty:
+        continue
+
+    subjects = sorted(dev_df['subject'].unique())
+
+    for subject in subjects:
+        sub_df = dev_df[dev_df['subject'] == subject]
+        if sub_df.empty:
+            continue
+
+        fig, axes = plt.subplots(3, len(channels_to_plot),
+                                  figsize=(4 * len(channels_to_plot), 11))
+
+        for col_idx, ch in enumerate(channels_to_plot):
+            row = sub_df[sub_df['channel'] == ch]
+
+            if row.empty:
+                for r in range(3):
+                    axes[r, col_idx].axis('off')
+                continue
+
+            abs_eo = row['abs_EO_dB'].values[0]
+            abs_ec = row['abs_EC_dB'].values[0]
+            rel_eo = row['rel_EO_pct'].values[0]
+            rel_ec = row['rel_EC_pct'].values[0]
+            react  = row['reactivity_dB'].values[0]
+            n_eo   = int(row['n_EO_trials'].values[0])
+            n_ec   = int(row['n_EC_trials'].values[0])
+
+            # --- Row 0: Absolute alpha power ---
+            ax0 = axes[0, col_idx]
+            make_bar(ax0, abs_eo, abs_ec, n_eo, n_ec)
+            if col_idx == 0:
+                ax0.set_ylabel('Absolute Alpha\nPower (dB)',
+                               fontsize=10, fontweight='bold')
+            ax0.set_title(f'Channel: {ch}', fontsize=11, fontweight='bold')
+
+            # --- Row 1: Relative alpha power ---
+            ax1 = axes[1, col_idx]
+            make_bar(ax1, rel_eo, rel_ec, n_eo, n_ec)
+            if col_idx == 0:
+                ax1.set_ylabel('Relative Alpha\nPower (%)',
+                               fontsize=10, fontweight='bold')
+
+            # --- Row 2: Reactivity ---
+            ax2 = axes[2, col_idx]
+            if not np.isnan(react):
+                bar_color = '#2ecc71' if react >= 0 else '#e74c3c'
+                ax2.bar(['EC − EO'], [react],
+                        color=bar_color, alpha=0.8, width=0.4)
+                ax2.axhline(0, color='black', linewidth=0.8, linestyle='--')
+                offset = abs(react) * 0.05
+                ax2.text(0, react + (offset if react >= 0 else -offset),
+                         f'{react:+.2f} dB',
+                         ha='center',
+                         va='bottom' if react >= 0 else 'top',
+                         fontsize=9, fontweight='bold')
+                spread = max(abs(react), 0.1)
+                ax2.set_ylim(react - spread * 0.5,
+                             react + spread * 0.5)
+            else:
+                ax2.text(0.5, 0.5, 'no data', ha='center', va='center',
+                         transform=ax2.transAxes, color='grey')
+
+            if col_idx == 0:
+                ax2.set_ylabel('Reactivity\n(EC − EO, dB)',
+                               fontsize=10, fontweight='bold')
+
+            ax2.grid(True, alpha=0.3, axis='y')
+            ax2.spines['top'].set_visible(False)
+            ax2.spines['right'].set_visible(False)
+
+        plt.suptitle(
+            f'Device: {device} | Subject: {subject}\n'
+            f'Row 1: Absolute Alpha Power (dB) — EO vs EC\n'
+            f'Row 2: Relative Alpha Power (%) — EO vs EC\n'
+            f'Row 3: Reactivity (EC − EO) — Green ✓ | Red ✗\n',
+            fontsize=11
+        )
+        plt.tight_layout()
+        save_path = os.path.join(
+            edf_folder, f'AlphaMetrics_{device}_{subject}.png'
+        )
+        plt.savefig(save_path, dpi=200)
+        plt.show()
+        print(f"  Saved → {save_path}")
+
+print("\n✅ Done.")
