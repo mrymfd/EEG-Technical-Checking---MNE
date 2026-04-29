@@ -1,0 +1,170 @@
+def parse_filename(fname):
+    name = fname.replace('.edf', '')
+    for device in devices:
+        if device not in name:
+            continue
+        remainder = name.replace(device, '')
+        m = re.match(r'^(sub\d+)(EO|EC)(\d*)$', remainder)
+        if m:
+            subject = m.group(1)
+            cond    = m.group(2)
+            trial   = m.group(3) if m.group(3) else '1'
+            return subject, cond, device, trial
+    return None
+    # ==========================================
+# ALL DEVICES — PSD BEFORE CHANNEL REJECTION
+# ==========================================
+print("\n" + "=" * 60)
+print("ALL DEVICES — PSD BEFORE CHANNEL REJECTION")
+print("=" * 60)
+
+for device in devices:
+
+    device_files = [f for f in edf_files
+                    if parse_filename(f) is not None
+                    and parse_filename(f)[2] == device]
+
+    if not device_files:
+        print(f"\nNo files found for {device}")
+        continue
+
+    print(f"\n{'='*40}")
+    print(f"Device: {device}")
+    print(f"{'='*40}")
+
+    # raw_psds[condition][subject][trial] = (freqs, psd_dict)
+    raw_psds = {cond: {} for cond in conditions}
+
+    for fname in device_files:
+        parsed = parse_filename(fname)
+        if parsed is None:
+            continue
+        subject, condition, _, trial = parsed  # unpack 4 values
+        print(f"\n→ {fname}  [sub={subject}  cond={condition}  trial={trial}]")
+
+        try:
+            raw = mne.io.read_raw_edf(
+                os.path.join(edf_folder, fname), preload=True, verbose=False
+            )
+            eeg_chs = [c for c in raw.ch_names if 'eeg' in c.lower()][:4]
+            raw.pick(eeg_chs)
+            rename = {k: v for k, v in channel_map.items() if k in raw.ch_names}
+            raw.rename_channels(rename)
+            raw.set_montage('standard_1020', verbose=False)
+            if raw.info['sfreq'] != 256:
+                raw.resample(256, verbose=False)
+            raw.filter(0.5, 20, verbose=False)
+
+            n_times    = int(raw.info['sfreq'] * 4)
+            safe_n_fft = min(2048, n_times)
+            safe_n_ov  = safe_n_fft // 2
+
+            spectrum = raw.compute_psd(method='welch', fmin=0.5, fmax=20,
+                                       n_fft=safe_n_fft, n_overlap=safe_n_ov,
+                                       verbose=False)
+            freqs = spectrum.freqs
+            psds  = spectrum.get_data()
+
+            psd_dict = {}
+            for ch in channels_to_plot:
+                if ch in raw.ch_names:
+                    idx = raw.ch_names.index(ch)
+                    psd_dict[ch] = psds[idx]
+                else:
+                    psd_dict[ch] = np.full(len(freqs), np.nan)
+
+            if subject not in raw_psds[condition]:
+                raw_psds[condition][subject] = {}
+            raw_psds[condition][subject][trial] = (freqs, psd_dict)
+            print(f"  ✓ Channels: {raw.ch_names}")
+
+        except Exception as e:
+            print(f"  ❌ Error: {e}")
+
+    # ----------------------------------------
+    # PLOT for this device
+    # one row per subject, one col per channel
+    # average across trials before plotting
+    # ----------------------------------------
+    subjects_dev = sorted(
+        set(raw_psds['EO'].keys()) | set(raw_psds['EC'].keys())
+    )
+
+    if not subjects_dev:
+        print(f"  No data to plot for {device}")
+        continue
+
+    n_subs = len(subjects_dev)
+    fig, axes = plt.subplots(n_subs, len(channels_to_plot),
+                              figsize=(4 * len(channels_to_plot), 4 * n_subs))
+
+    if n_subs == 1:
+        axes = axes[np.newaxis, :]
+
+    for row_idx, subject in enumerate(subjects_dev):
+        for col_idx, ch in enumerate(channels_to_plot):
+            ax = axes[row_idx, col_idx]
+            plotted = False
+
+            for cond, color, ls, label in [
+                ('EO', 'blue', '-',  'Eyes Open'),
+                ('EC', 'red',  '--', 'Eyes Closed'),
+            ]:
+                if subject not in raw_psds[cond]:
+                    continue
+
+                # Average across trials in raw power space
+                trial_psds = []
+                freqs_ref  = None
+                for trial, (freqs, psd_dict) in \
+                        raw_psds[cond][subject].items():
+                    arr = psd_dict.get(ch)
+                    if arr is not None and not np.all(np.isnan(arr)):
+                        trial_psds.append(arr)
+                        freqs_ref = freqs
+
+                if not trial_psds:
+                    continue
+
+                mean_psd = np.mean(trial_psds, axis=0)
+                n_trials = len(trial_psds)
+
+                ax.plot(freqs_ref, 10 * np.log10(mean_psd),
+                        color=color, linestyle=ls,
+                        linewidth=1.5,
+                        label=f'{label} (n={n_trials})')
+                plotted = True
+
+            if not plotted:
+                ax.text(0.5, 0.5, 'No data', ha='center', va='center',
+                        transform=ax.transAxes, color='grey', fontsize=9)
+
+            ax.axvspan(8, 12, alpha=0.15, color='yellow', label='Alpha')
+            ax.set_xlim(0.5, 20)
+            ax.set_xlabel('Frequency (Hz)')
+            ax.grid(True, alpha=0.3)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            ax.legend(fontsize=7)
+
+            if row_idx == 0:
+                ax.set_title(f'Channel: {ch}', fontsize=11,
+                             fontweight='bold')
+            if col_idx == 0:
+                ax.set_ylabel(f'{subject}\nPower (dB)',
+                              fontsize=10, fontweight='bold')
+
+    plt.suptitle(
+        f'{device} — PSD Before Channel Rejection\n'
+        f'Blue = Eyes Open | Red = Eyes Closed | Yellow = Alpha band\n'
+        f'All 4 channels retained | Trials averaged per condition',
+        fontsize=12
+    )
+    plt.tight_layout()
+    save_path = os.path.join(edf_folder,
+                             f'{device}_PSD_before_rejection.png')
+    plt.savefig(save_path, dpi=200)
+    plt.show()
+    print(f"\n  Saved → {save_path}")
+
+print("\n✅ Done.")
